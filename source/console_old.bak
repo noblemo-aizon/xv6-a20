@@ -1,0 +1,331 @@
+﻿/*****************************************************************
+ *       console.c
+ *       adapted from MIT xv6 by Zhiyi Huang, hzy@cs.otago.ac.nz
+ *       University of Otago
+ *
+ ********************************************************************/
+
+#include "types.h"
+#include "defs.h"
+#include "param.h"
+#include "traps.h"
+#include "spinlock.h"
+#include "fs.h"
+#include "file.h"
+#include "memlayout.h"
+#include "mmu.h"
+#include "proc.h"
+#include "arm.h"
+
+#define BACKSPACE 0x100
+
+static int panicked = 0;
+
+static struct {
+	struct spinlock lock;
+	int locking;
+} cons;
+
+
+uint cursor_x=0, cursor_y=0;
+uint frameheight=1024, framewidth=1280, framedepth=16;
+uint fontheight=16, fontwidth=8;
+FBI fbinfo __attribute__ ((aligned (16), nocommon));
+
+extern volatile uint *mailbuffer;
+extern u8 font[];
+static uint gpucolour=0xffff;
+
+#define INPUT_BUF 128
+struct {
+	struct spinlock lock;
+	char buf[INPUT_BUF];
+	uint r;  // Read index
+	uint w;  // Write index
+	uint e;  // Edit index
+} input;
+
+int
+consolewrite(struct inode *ip, char *buf, int n)
+{
+	int i;
+
+	//  cprintf("consolewrite is called: ip=%x buf=%x, n=%x", ip, buf, n);
+	iunlock(ip);
+	acquire(&cons.lock);
+	for(i = 0; i < n; i++){
+#if defined (RPI1)
+		uartputc(buf[i] & 0xff);
+#elif defined (RPI2)
+		uartputc(buf[i] & 0xff);
+#elif defined (FVP)
+		uartputc_fvp(buf[i] & 0xff);
+#endif
+
+	}
+	release(&cons.lock);
+	ilock(ip);
+
+	return n;
+}
+
+
+static void
+printint(int xx, int base, int sign)
+{
+	static u8 digits[] = "0123456789abcdef";
+	u8 buf[16];
+	int i;
+	uint x, y, b;
+
+	if(sign && (sign = xx < 0))
+		x = -xx;
+	else
+		x = xx;
+
+	b = base;
+	i = 0;
+	do{
+		y = div(x, b);
+		buf[i++] = digits[x - y * b];
+	}while((x = y) != 0);
+
+	if(sign)
+		buf[i++] = '-';
+
+	while(--i >= 0){
+		#if defined (RPI1)
+		uartputc(buf[i]);
+		#elif defined (RPI2)
+		uartputc(buf[i]);
+		#elif defined (FVP)
+		uartputc_fvp(buf[i]);
+		#endif
+	}
+}
+
+
+// Print to the console. only understands %d, %x, %p, %s.
+void
+cprintf(char *fmt, ...)
+{
+	int i, c;
+	int locking;
+	uint *argp;
+	char *s;
+
+	locking = cons.locking;
+	if(locking)
+		acquire(&cons.lock);
+
+	if (fmt == 0)
+		panic("null fmt");
+
+	argp = (uint *)(void*)(&fmt + 1);
+	for(i = 0; (c = fmt[i] & 0xff) != 0; i++){
+		if(c != '%'){
+			#if defined (RPI1)
+			uartputc(c);
+			#elif defined (RPI2)
+			uartputc(c);
+			#elif defined (FVP)
+			uartputc_fvp(c);
+			#endif
+			continue;
+		}
+		c = fmt[++i] & 0xff;
+		if(c == 0)
+			break;
+		switch(c){
+		case 'd':
+			printint(*argp++, 10, 1);
+			break;
+		case 'x':
+		case 'p':
+			printint(*argp++, 16, 0);
+			break;
+		case 's':
+			if((s = (char*)*argp++) == 0)
+				s = "(null)";
+			for(; *s; s++){
+				#if defined (RPI1)
+				uartputc(*s);
+				#elif defined (RPI2)
+				uartputc(*s);
+				#elif defined (FVP)
+				uartputc_fvp(*s);
+				#endif
+			}
+			break;
+		case '%':
+			#if defined (RPI1)
+			uartputc('%');
+			#elif defined (RPI2)
+			uartputc('%');
+			#elif defined (FVP)
+			uartputc_fvp('%');
+			#endif
+			break;
+		default:
+			// Print unknown % sequence to draw attention.
+			#if defined (RPI1)
+			uartputc('%');
+			uartputc(c);
+			#elif defined (RPI2)
+			uartputc('%');
+			uartputc(c);
+			#elif defined (FVP)
+			uartputc_fvp('%');
+			uartputc_fvp(c);
+			#endif
+			break;
+		}
+	}
+	if(locking)
+		release(&cons.lock);
+}
+
+void
+panic(char *s)
+{
+	int i;
+	uint pcs[10];
+
+	cprintf("cpu%d: panic: ", 0);
+	cprintf(s);
+	cprintf("\n");
+	getcallerpcs(&s, pcs);
+	for(i=0; i<10; i++)
+		cprintf(" %p", pcs[i]);
+	panicked = 1; // freeze other CPU
+
+	for(;;)
+		;
+}
+
+#define C(x)  ((x)-'@')  // Control-x
+
+void
+consputc(int c)
+{
+	if(panicked){
+		cli();
+		for(;;)
+			;
+	}
+
+	if(c == BACKSPACE){
+		//#if defined (RPI1)
+		//#endif
+		uartputc('\b'); uartputc(' '); uartputc('\b');
+	} else if(c == C('D')) {
+		//#if defined (RPI1)
+		//#endif
+		uartputc('^'); uartputc('D');
+	} else {
+		//#if defined (RPI1)
+		//#endif
+		uartputc(c);
+	}
+}
+
+
+void
+consoleintr(int (*getc)(void))
+{
+	int c;
+
+	acquire(&input.lock);
+	while((c = getc()) >= 0){
+		switch(c){
+		case C('P'):  // Process listing.
+    		  procdump();
+		break;
+		case C('U'):  // Kill line.
+    		  while(input.e != input.w &&
+    				  input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+    			  input.e--;
+    			  consputc(BACKSPACE);
+    		  }
+		break;
+		case C('H'): case '\x7f':  // Backspace
+			if(input.e != input.w){
+				input.e--;
+				consputc(BACKSPACE);
+			}
+			break;
+		default:
+			if(c != 0 && input.e-input.r < INPUT_BUF){
+				if(c == 0xa) break;
+				c = (c == 0xd) ? '\n' : c;
+				input.buf[input.e++ % INPUT_BUF] = c;
+				consputc(c);
+				if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
+					input.w = input.e;
+					wakeup(&input.r);
+				}
+			}
+			break;
+		}
+	}
+	release(&input.lock);
+}
+
+int
+consoleread(struct inode *ip, char *dst, int n)
+{
+	uint target;
+	int c;
+
+	//cprintf("inside consoleread\n");
+	iunlock(ip);
+	target = n;
+	acquire(&input.lock);
+	while(n > 0){
+		while(input.r == input.w){
+			if(curr_proc->killed){
+				release(&input.lock);
+				ilock(ip);
+				return -1;
+			}
+			sleep(&input.r, &input.lock);
+		}
+		c = input.buf[input.r++ % INPUT_BUF];
+		if(c == C('D')){  // EOF
+			if(n < target){
+				// Save ^D for next time, to make sure
+				// caller gets a 0-byte result.
+				input.r--;
+			}
+			break;
+		}
+		*dst++ = c;
+		--n;
+		if(c == '\n')
+			break;
+	}
+	release(&input.lock);
+	ilock(ip);
+
+	return target - n;
+}
+
+
+void consoleinit(void)
+{
+
+	fbinfo.fbp = 0;
+	initlock(&cons.lock, "console");
+	memset(&input, 0, sizeof(input));
+	initlock(&input.lock, "input");
+
+	memset(devsw, 0, sizeof(struct devsw)*NDEV);
+	devsw[CONSOLE].write = consolewrite;
+	devsw[CONSOLE].read = consoleread;
+	cons.locking = 1;
+	panicked = 0; // must initialize in code since the compiler does not
+
+	cursor_x=cursor_y=0;
+
+}
+
